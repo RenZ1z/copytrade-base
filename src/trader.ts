@@ -4,7 +4,7 @@ import { logger } from "./logger";
 
 const ZEROX_PRICE_URL = "https://api.0x.org/swap/allowance-holder/price";
 const ZEROX_QUOTE_URL = "https://api.0x.org/swap/allowance-holder/quote";
-const ALLOWANCE_HOLDER = "0x0000000000001fF3684f28c67538d4D072C22734"; // Confirma esse endereço!
+const ALLOWANCE_HOLDER = "0x0000000000001fF3684f28c67538d4D072C22734";
 const WETH = process.env.WETH_ADDRESS!;
 const ETH_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
@@ -25,6 +25,46 @@ export interface TradeResult {
 
 let ethPriceUsd = 2000;
 
+// ─────────────────────────────────────────────
+// NONCE MANAGER — evita replacement underpriced
+// ─────────────────────────────────────────────
+let currentNonce: number | null = null;
+let nonceLock = false;
+const nonceLockQueue: (() => void)[] = [];
+
+async function acquireNonceLock(): Promise<void> {
+  if (!nonceLock) {
+    nonceLock = true;
+    return;
+  }
+  return new Promise(resolve => nonceLockQueue.push(resolve));
+}
+
+function releaseNonceLock(): void {
+  const next = nonceLockQueue.shift();
+  if (next) {
+    next();
+  } else {
+    nonceLock = false;
+  }
+}
+
+async function getNextNonce(signer: ethers.Wallet): Promise<number> {
+  await acquireNonceLock();
+  try {
+    if (currentNonce === null) {
+      currentNonce = await signer.getNonce("pending");
+    }
+    return currentNonce++;
+  } finally {
+    releaseNonceLock();
+  }
+}
+
+function resetNonce(): void {
+  currentNonce = null;
+}
+
 async function getEthPrice(): Promise<number> {
   try {
     const res = await axios.get(
@@ -38,17 +78,30 @@ async function getEthPrice(): Promise<number> {
   return ethPriceUsd;
 }
 
-async function sendAndWait(signer: ethers.Wallet, tx: { to: string; data: string; value?: string; gas?: string }): Promise<ethers.TransactionReceipt | null> {
-  const sent = await signer.sendTransaction({
-    to: tx.to,
-    data: tx.data,
-    value: BigInt(tx.value ?? "0"),
-    gasLimit: BigInt(Math.round(Number(tx.gas ?? "500000") * 1.3)),
-  });
-  return await sent.wait();
+async function sendAndWait(
+  signer: ethers.Wallet,
+  tx: { to: string; data: string; value?: string; gas?: string }
+): Promise<ethers.TransactionReceipt | null> {
+  const nonce = await getNextNonce(signer);
+  try {
+    const sent = await signer.sendTransaction({
+      to: tx.to,
+      data: tx.data,
+      value: BigInt(tx.value ?? "0"),
+      gasLimit: BigInt(Math.round(Number(tx.gas ?? "500000") * 1.3)),
+      nonce,
+    });
+    return await sent.wait();
+  } catch (err: any) {
+    // Se der erro de nonce, reseta pra pegar o atual da chain na próxima
+    if (err.code === "NONCE_EXPIRED" || err.code === "REPLACEMENT_UNDERPRICED" || err.message?.includes("nonce")) {
+      logger.warn("⚠️  Erro de nonce, resetando...");
+      resetNonce();
+    }
+    throw err;
+  }
 }
 
-// Helper pra verificar e fazer approve se necessário
 async function checkAndApproveToken(
   tokenAddress: string,
   amount: string,
@@ -71,13 +124,12 @@ async function checkAndApproveToken(
 
     if (currentAllowance < amountBigInt) {
       logger.info(`📝 Fazendo approve de ${tokenAddress} pro AllowanceHolder...`);
-
-      const tx = await tokenContract.approve(ALLOWANCE_HOLDER, amountBigInt);
+      const nonce = await getNextNonce(signer);
+      const tx = await tokenContract.approve(ALLOWANCE_HOLDER, amountBigInt, { nonce });
       const receipt = await tx.wait();
 
       if (receipt?.status === 1) {
         logger.info(`✅ Aprovação confirmada: ${receipt.hash}`);
-        // Espera um pouco pra garantir que a allowance foi atualizada na chain
         await new Promise(r => setTimeout(r, 2000));
         return true;
       } else {
@@ -89,6 +141,9 @@ async function checkAndApproveToken(
     logger.info(`✅ Já tem allowance suficiente`);
     return true;
   } catch (err: any) {
+    if (err.code === "NONCE_EXPIRED" || err.code === "REPLACEMENT_UNDERPRICED" || err.message?.includes("nonce")) {
+      resetNonce();
+    }
     logger.error(`❌ Erro no approve: ${err.message}`);
     return false;
   }
@@ -109,19 +164,9 @@ export async function executeCopyTrade(params: {
   logger.info(`💱 [BUY] Cotando: ${ethAmount.toFixed(6)} ETH (~$${amountUsd}) -> ${tokenOut}`);
 
   try {
-    // Primeiro pega o price pra ver se tem liquidez
     const priceRes = await axios.get(ZEROX_PRICE_URL, {
-      headers: {
-        "0x-api-key": process.env.ZEROX_API_KEY!,
-        "0x-version": "v2",
-      },
-      params: {
-        chainId: 8453,
-        sellToken: ETH_ADDRESS,
-        buyToken: tokenOut,
-        sellAmount,
-        taker: walletAddress,
-      },
+      headers: { "0x-api-key": process.env.ZEROX_API_KEY!, "0x-version": "v2" },
+      params: { chainId: 8453, sellToken: ETH_ADDRESS, buyToken: tokenOut, sellAmount, taker: walletAddress },
       timeout: 10000,
     });
 
@@ -129,12 +174,8 @@ export async function executeCopyTrade(params: {
       return { status: "failed", sellAmountEth: ethAmount, ethPriceUsd: price, errorMsg: "Sem liquidez disponível" };
     }
 
-    // Agora pega o quote firm
     const quoteRes = await axios.get(ZEROX_QUOTE_URL, {
-      headers: {
-        "0x-api-key": process.env.ZEROX_API_KEY!,
-        "0x-version": "v2",
-      },
+      headers: { "0x-api-key": process.env.ZEROX_API_KEY!, "0x-version": "v2" },
       params: {
         chainId: 8453,
         sellToken: ETH_ADDRESS,
@@ -160,21 +201,8 @@ export async function executeCopyTrade(params: {
       const gasPriceGwei = receipt.gasPrice ? parseFloat(ethers.formatUnits(receipt.gasPrice, "gwei")) : undefined;
       const gasUsed = receipt.gasUsed ? Number(receipt.gasUsed) : undefined;
       const gasCostEth = gasUsed && gasPriceGwei ? (gasUsed * gasPriceGwei) / 1e9 : undefined;
-
       logger.info(`✅ BUY confirmada no bloco ${receipt.blockNumber} (gas: ${gasUsed})`);
-
-      return {
-        status: "success",
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        buyAmountRaw: quote.buyAmount,
-        sellAmountEth: ethAmount,
-        ethPriceUsd: price,
-        gasUsed,
-        gasPriceGwei,
-        gasCostEth,
-        confirmedAtMs
-      };
+      return { status: "success", txHash: receipt.hash, blockNumber: receipt.blockNumber, buyAmountRaw: quote.buyAmount, sellAmountEth: ethAmount, ethPriceUsd: price, gasUsed, gasPriceGwei, gasCostEth, confirmedAtMs };
     } else {
       logger.error(`❌ BUY revertida`);
       return { status: "failed", sellAmountEth: ethAmount, ethPriceUsd: price, confirmedAtMs, errorMsg: "tx reverted" };
@@ -211,41 +239,25 @@ export async function executeCopySell(params: {
   logger.info(`💱 [SELL] Cotando: ${ethers.formatUnits(balance, decimals)} tokens (${tokenIn}) -> ETH`);
 
   try {
-    // Primeiro pega o price pra verificar issues
     const priceRes = await axios.get(ZEROX_PRICE_URL, {
-      headers: {
-        "0x-api-key": process.env.ZEROX_API_KEY!,
-        "0x-version": "v2",
-      },
-      params: {
-        chainId: 8453,
-        sellToken: tokenIn,
-        buyToken: ETH_ADDRESS,
-        sellAmount: balance.toString(),
-        taker: walletAddress,
-      },
+      headers: { "0x-api-key": process.env.ZEROX_API_KEY!, "0x-version": "v2" },
+      params: { chainId: 8453, sellToken: tokenIn, buyToken: ETH_ADDRESS, sellAmount: balance.toString(), taker: walletAddress },
       timeout: 10000,
     });
 
     logger.info(`📋 Price response keys: ${Object.keys(priceRes.data).join(', ')}`);
 
-    // Verifica se precisa de allowance e faz approve ANTES do quote
     if (priceRes.data?.issues?.allowance) {
       const allowanceInfo = priceRes.data.issues.allowance;
       logger.info(`⚠️  Allowance necessária: ${JSON.stringify(allowanceInfo)}`);
-
       const approved = await checkAndApproveToken(tokenIn, balance.toString(), signer, provider);
       if (!approved) {
         return { status: "failed", sellAmountEth: 0, ethPriceUsd: price, errorMsg: "Falha na aprovação do token" };
       }
     }
 
-    // Agora pega o quote firm (depois do approve)
     const quoteRes = await axios.get(ZEROX_QUOTE_URL, {
-      headers: {
-        "0x-api-key": process.env.ZEROX_API_KEY!,
-        "0x-version": "v2",
-      },
+      headers: { "0x-api-key": process.env.ZEROX_API_KEY!, "0x-version": "v2" },
       params: {
         chainId: 8453,
         sellToken: tokenIn,
@@ -268,7 +280,6 @@ export async function executeCopySell(params: {
     logger.info(`📋 Transaction to send: to=${quote.transaction.to}, data=${quote.transaction.data?.slice(0, 30)}..., value=${quote.transaction.value}`);
 
     const buyAmountEth = parseFloat(ethers.formatEther(quote.buyAmount || "0"));
-
     const receipt = await sendAndWait(signer, quote.transaction);
     const confirmedAtMs = Date.now();
 
@@ -276,20 +287,8 @@ export async function executeCopySell(params: {
       const gasPriceGwei = receipt.gasPrice ? parseFloat(ethers.formatUnits(receipt.gasPrice, "gwei")) : undefined;
       const gasUsed = receipt.gasUsed ? Number(receipt.gasUsed) : undefined;
       const gasCostEth = gasUsed && gasPriceGwei ? (gasUsed * gasPriceGwei) / 1e9 : undefined;
-
       logger.info(`✅ SELL confirmada no bloco ${receipt.blockNumber} (gas: ${gasUsed})`);
-
-      return {
-        status: "success",
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        sellAmountEth: buyAmountEth,
-        ethPriceUsd: price,
-        gasUsed,
-        gasPriceGwei,
-        gasCostEth,
-        confirmedAtMs
-      };
+      return { status: "success", txHash: receipt.hash, blockNumber: receipt.blockNumber, sellAmountEth: buyAmountEth, ethPriceUsd: price, gasUsed, gasPriceGwei, gasCostEth, confirmedAtMs };
     } else {
       logger.error(`❌ SELL revertida`);
       return { status: "failed", sellAmountEth: 0, ethPriceUsd: price, confirmedAtMs, errorMsg: "tx reverted" };
