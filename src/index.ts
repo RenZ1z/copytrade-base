@@ -189,15 +189,138 @@ async function handlePendingTx(tx: {
       }
     }
   } else {
-    // Protocolo que não conseguimos decodificar completamente (ex: Universal Router)
-    // Guarda na fila e aguarda confirmação para pegar o tokenOut via receipt
-    logger.info(`⏳ tokenOut não decodificável via input, aguardando confirmação...`);
-    pendingTrades.set(tx.hash, {
-      from,
-      tokenIn,
-      tokenOut: undefined,
-      detectedAt: now,
-    });
+    // tokenOut não decodificável via input (ex: GMGN, Universal Router)
+    // Poll direto pelo receipt após 3s — mais confiável que esperar pelo bloco
+    logger.info(`⏳ tokenOut não decodificável, aguardando receipt em 3s...`);
+    const txHash = tx.hash;
+    const capturedFrom = from;
+    const capturedTokenIn = tokenIn;
+    const capturedNow = now;
+
+    setTimeout(async () => {
+      try {
+        // Tenta até 10x com intervalo de 2s (20s total)
+        let receipt = null;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          receipt = await httpProvider.getTransactionReceipt(txHash);
+          if (receipt) break;
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        if (!receipt) {
+          logger.warn(`⚠️  Receipt não encontrado após 20s para ${txHash}, TX pode ter sido dropada`);
+          return;
+        }
+
+        const transferTopic = ethers.id("Transfer(address,address,uint256)");
+        const relevantLogs = receipt.logs.filter(
+          (log) =>
+            log.topics[0] === transferTopic &&
+            log.topics[2] &&
+            ethers.dataSlice(log.topics[2], 12).toLowerCase() === capturedFrom
+        );
+
+        if (relevantLogs.length === 0) {
+          logger.warn(`⚠️  Nenhum Transfer para ${capturedFrom} encontrado no receipt`);
+          return;
+        }
+
+        const resolvedTokenOut = relevantLogs[relevantLogs.length - 1].address;
+        logger.info(`🪙 tokenOut resolvido via receipt: ${resolvedTokenOut}`);
+
+        // Cooldown
+        const nowMs = Date.now();
+        const lastTime = lastTrade.get(capturedFrom) ?? 0;
+        if (nowMs - lastTime < COOLDOWN_MS) {
+          logger.warn(`⏳ Cooldown ativo para ${capturedFrom}, abortando trade`);
+          return;
+        }
+        lastTrade.set(capturedFrom, nowMs);
+
+        // Checagem de saldo
+        const bal = await httpProvider.getBalance(process.env.MY_WALLET_ADDRESS!);
+        const reqEth = (TRADE_AMOUNT_USD / 2000) * 1.05;
+        if (bal < ethers.parseEther(reqEth.toFixed(8))) {
+          logger.warn(`⚠️  Saldo insuficiente, pulando trade`);
+          await notifyInsufficientBalance({
+            currentEth: parseFloat(ethers.formatEther(bal)).toFixed(6),
+            requiredUsd: TRADE_AMOUNT_USD,
+            ethPriceUsd: 2000,
+          });
+          return;
+        }
+
+        const executedAtMs = Date.now();
+        const tradeId = insertTrade({
+          whale_wallet: capturedFrom,
+          my_wallet: process.env.MY_WALLET_ADDRESS!,
+          token_in: capturedTokenIn,
+          token_out: resolvedTokenOut,
+          amount_usd: TRADE_AMOUNT_USD,
+          sell_amount_eth: 0,
+          buy_amount_raw: "",
+          eth_price_usd: 0,
+          detected_at_ms: capturedNow,
+          executed_at_ms: executedAtMs,
+          delay_ms: executedAtMs - capturedNow,
+          whale_tx_hash: txHash,
+          status: "pending",
+        });
+
+        const result = await executeCopyTrade({
+          tokenIn: capturedTokenIn,
+          tokenOut: resolvedTokenOut,
+          amountUsd: TRADE_AMOUNT_USD,
+          walletAddress: process.env.MY_WALLET_ADDRESS!,
+          signer,
+          provider: httpProvider,
+        });
+
+        if (result.status === "skipped") {
+          skipTrade(tradeId, result.skipReason ?? "unknown");
+          if (result.skipReason === "whale_sold_to_eth") {
+            await notifySellDetected({ whaleWallet: capturedFrom, tokenIn: capturedTokenIn, whaleTxHash: txHash });
+          }
+        } else {
+          updateTradeConfirmed(tradeId, {
+            status: result.status,
+            confirmed_at_ms: result.confirmedAtMs ?? Date.now(),
+            block_number: result.blockNumber,
+            gas_used: result.gasUsed,
+            gas_price_gwei: result.gasPriceGwei,
+            gas_cost_eth: result.gasCostEth,
+            my_tx_hash: result.txHash,
+            error_msg: result.errorMsg,
+          });
+          const { db } = require("./journal");
+          db.prepare("UPDATE trades SET sell_amount_eth = ?, buy_amount_raw = ?, eth_price_usd = ? WHERE id = ?")
+            .run(result.sellAmountEth, result.buyAmountRaw ?? "", result.ethPriceUsd, tradeId);
+
+          if (result.status === "success" && result.txHash) {
+            await notifyBuyExecuted({
+              whaleWallet: capturedFrom,
+              tokenOut: resolvedTokenOut,
+              amountUsd: TRADE_AMOUNT_USD,
+              sellAmountEth: result.sellAmountEth,
+              ethPriceUsd: result.ethPriceUsd,
+              txHash: result.txHash,
+              whaleTxHash: txHash,
+              delayMs: executedAtMs - capturedNow,
+              gasCostEth: result.gasCostEth,
+            });
+          } else if (result.status === "failed") {
+            await notifyBuyFailed({
+              whaleWallet: capturedFrom,
+              tokenOut: resolvedTokenOut,
+              reason: result.errorMsg ?? "unknown",
+              whaleTxHash: txHash,
+            });
+          }
+        }
+      } catch (err: any) {
+        logger.error(`❌ Erro no fallback receipt para ${txHash}: ${err.message}`);
+      }
+    }, 3000);
   }
 }
 
