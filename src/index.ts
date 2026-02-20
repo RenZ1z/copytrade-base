@@ -392,29 +392,38 @@ function connectWS(): void {
         const blockHash = msg.params.result?.hash;
         if (!blockHash) return;
 
-        // Busca bloco com TXs completas (true = incluir txs)
-        const block = await httpProvider.getBlock(blockHash, true);
-        if (!block?.transactions) return;
+        logger.info(`📦 Bloco recebido: ${blockHash}`);
 
-        for (const tx of block.transactions) {
-          if (typeof tx === "string") continue;
-          if (!tx.from) continue;
-          const from = tx.from.toLowerCase();
+        // ethers.js v6 na Base retorna só hashes mesmo com includeTransactions=true
+        // Usa JSON-RPC direto pra garantir TXs completas
+        const rpcRes = await fetch(process.env.ALCHEMY_HTTP_URL!, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_getBlockByHash",
+            params: [blockHash, true],
+          }),
+        });
+        const rpcJson = await rpcRes.json() as any;
+        const txs: any[] = rpcJson?.result?.transactions ?? [];
+
+        for (const tx of txs) {
+          if (!tx?.from) continue;
+          const from = (tx.from as string).toLowerCase();
 
           if (TARGET_WALLETS.includes(from)) {
-            // TX de uma wallet alvo confirmada no bloco
-            // Usa o fluxo de handlePendingTx mas com dados já completos
             handlePendingTx({
               hash: tx.hash,
               from: tx.from,
-              to: tx.to,
-              input: tx.data,
-              value: tx.value.toString(),
+              to: tx.to ?? null,
+              input: tx.input ?? "0x",
+              value: tx.value ?? "0x0",
             }).catch((err) =>
               logger.error(`Erro no handler tx: ${err.message}`)
             );
           } else if (pendingTrades.has(tx.hash)) {
-            // TX que estava aguardando confirmação para pegar tokenOut via receipt
             handleConfirmedTx(tx.hash).catch((err) =>
               logger.error(`Erro no handler confirmed: ${err.message}`)
             );
