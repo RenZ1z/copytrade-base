@@ -37,14 +37,50 @@ const lastTrade: Map<string, number> = new Map();
 const COOLDOWN_MS = 10_000;
 const processedTxs = new Set<string>();
 
-// Mapa de posições abertas: whale -> Set de tokens comprados
-const openPositions: Map<string, Set<string>> = new Map();
+// ─────────────────────────────────────────────
+// POSIÇÕES ABERTAS COM PERSISTÊNCIA EM ARQUIVO
+// ─────────────────────────────────────────────
+const POSITIONS_FILE = "data/positions.json";
+
+function loadPositions(): Map<string, Set<string>> {
+  try {
+    if (!fs.existsSync("data")) fs.mkdirSync("data");
+    if (!fs.existsSync(POSITIONS_FILE)) return new Map();
+    const raw = fs.readFileSync(POSITIONS_FILE, "utf-8");
+    const obj: Record<string, string[]> = JSON.parse(raw);
+    const map = new Map<string, Set<string>>();
+    for (const [whale, tokens] of Object.entries(obj)) {
+      map.set(whale, new Set(tokens));
+    }
+    logger.info(`📂 Posições carregadas do disco: ${JSON.stringify(obj)}`);
+    return map;
+  } catch {
+    logger.warn("⚠️  Não foi possível carregar posições do disco, iniciando zerado");
+    return new Map();
+  }
+}
+
+function savePositions(map: Map<string, Set<string>>) {
+  try {
+    if (!fs.existsSync("data")) fs.mkdirSync("data");
+    const obj: Record<string, string[]> = {};
+    for (const [whale, tokens] of map.entries()) {
+      if (tokens.size > 0) obj[whale] = Array.from(tokens);
+    }
+    fs.writeFileSync(POSITIONS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err: any) {
+    logger.error(`❌ Erro ao salvar posições: ${err.message}`);
+  }
+}
+
+const openPositions: Map<string, Set<string>> = loadPositions();
 
 function addPosition(whaleAddress: string, tokenAddress: string) {
   const addr = whaleAddress.toLowerCase();
   const token = tokenAddress.toLowerCase();
   if (!openPositions.has(addr)) openPositions.set(addr, new Set());
   openPositions.get(addr)!.add(token);
+  savePositions(openPositions);
   logger.info(`📌 Posição registrada: ${token} (whale: ${addr})`);
 }
 
@@ -52,6 +88,7 @@ function removePosition(whaleAddress: string, tokenAddress: string) {
   const addr = whaleAddress.toLowerCase();
   const token = tokenAddress.toLowerCase();
   openPositions.get(addr)?.delete(token);
+  savePositions(openPositions);
   logger.info(`🗑️  Posição removida: ${token}`);
 }
 
