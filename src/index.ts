@@ -157,11 +157,11 @@ async function handlePendingTx(tx: {
         status: result.status,
         confirmed_at_ms: result.confirmedAtMs ?? Date.now(),
         block_number: result.blockNumber ?? undefined,
-gas_used: result.gasUsed ?? undefined,
-gas_price_gwei: result.gasPriceGwei ?? undefined,
-gas_cost_eth: result.gasCostEth ?? undefined,
-my_tx_hash: result.txHash ?? undefined,
-error_msg: result.errorMsg ?? undefined,
+        gas_used: result.gasUsed ?? undefined,
+        gas_price_gwei: result.gasPriceGwei ?? undefined,
+        gas_cost_eth: result.gasCostEth ?? undefined,
+        my_tx_hash: result.txHash ?? undefined,
+        error_msg: result.errorMsg ?? undefined,
       });
       const { db } = require("./journal");
       db.prepare("UPDATE trades SET sell_amount_eth = ?, buy_amount_raw = ?, eth_price_usd = ? WHERE id = ?")
@@ -420,12 +420,12 @@ async function handleConfirmedTx(txHash: string): Promise<void> {
     updateTradeConfirmed(tradeId2, {
       status: result2.status,
       confirmed_at_ms: result2.confirmedAtMs ?? Date.now(),
-      block_number: result2.blockNumber,
-      gas_used: result2.gasUsed,
-      gas_price_gwei: result2.gasPriceGwei,
-      gas_cost_eth: result2.gasCostEth,
-      my_tx_hash: result2.txHash,
-      error_msg: result2.errorMsg,
+      block_number: result2.blockNumber ?? undefined,
+      gas_used: result2.gasUsed ?? undefined,
+      gas_price_gwei: result2.gasPriceGwei ?? undefined,
+      gas_cost_eth: result2.gasCostEth ?? undefined,
+      my_tx_hash: result2.txHash ?? undefined,
+      error_msg: result2.errorMsg ?? undefined,
     });
     const { db } = require("./journal");
     db.prepare("UPDATE trades SET sell_amount_eth = ?, buy_amount_raw = ?, eth_price_usd = ? WHERE id = ?")
