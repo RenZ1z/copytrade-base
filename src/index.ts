@@ -321,7 +321,7 @@ function connectWS(): void {
       const blockHash = msg.params.result?.hash;
       if (!blockHash) return;
 
-      logger.info(`📦 Bloco recebido: ${blockHash}`);
+      // logger.info(`📦 Bloco recebido: ${blockHash}`);
 
       const rpcRes = await fetch(process.env.ALCHEMY_HTTP_URL!, {
         method: "POST",
