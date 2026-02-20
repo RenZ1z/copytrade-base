@@ -156,12 +156,12 @@ async function handlePendingTx(tx: {
       updateTradeConfirmed(tradeId, {
         status: result.status,
         confirmed_at_ms: result.confirmedAtMs ?? Date.now(),
-        block_number: result.blockNumber,
-        gas_used: result.gasUsed,
-        gas_price_gwei: result.gasPriceGwei,
-        gas_cost_eth: result.gasCostEth,
-        my_tx_hash: result.txHash,
-        error_msg: result.errorMsg,
+        block_number: result.blockNumber ?? undefined,
+gas_used: result.gasUsed ?? undefined,
+gas_price_gwei: result.gasPriceGwei ?? undefined,
+gas_cost_eth: result.gasCostEth ?? undefined,
+my_tx_hash: result.txHash ?? undefined,
+error_msg: result.errorMsg ?? undefined,
       });
       const { db } = require("./journal");
       db.prepare("UPDATE trades SET sell_amount_eth = ?, buy_amount_raw = ?, eth_price_usd = ? WHERE id = ?")
