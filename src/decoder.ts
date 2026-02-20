@@ -1,5 +1,4 @@
 import { ethers } from "ethers";
-
 const SWAP_SELECTORS: Record<string, string> = {
   // Uniswap V3 / Uniswap Universal Router
   "0x5ae401dc": "Uniswap V3 - multicall",
@@ -27,8 +26,8 @@ const SWAP_SELECTORS: Record<string, string> = {
   "0x0b68e4e8": "GMGN/OKX - smartSwapByOrderId",
   "0x2e1a7d4d": "GMGN/OKX - withdrawETH",
   "0xcae6a6b3": "GMGN/OKX - multicall",
+  "0x784e2685": "GMGN/OKX - swap",
 };
-
 const KNOWN_ROUTERS: Set<string> = new Set([
   "0x4409921ae43a39a11d90f7b7f96cfd0b8093d9fc",
   "0x77449ff075c0a385796da0762bcb46fd5cc884c6",
@@ -37,7 +36,6 @@ const KNOWN_ROUTERS: Set<string> = new Set([
   "0x1111111254eeb25477b68fb85ed929f73a960582",
   "0x1985b39d5e55940f2e2b2ded79a23b9e5a25f4ff",
 ].map(a => a.toLowerCase()));
-
 export interface SwapInfo {
   isSwap: boolean;
   protocol?: string;
@@ -46,12 +44,6 @@ export interface SwapInfo {
   tokenOut?: string;
   amountIn?: bigint;
 }
-
-/**
- * Tenta identificar se uma tx é um swap e extrai informações básicas.
- * Para Uniswap V3 exactInputSingle, decodifica tokenIn/tokenOut/amountIn.
- * Para outros protocolos, apenas sinaliza que é um swap.
- */
 export function decodeSwap(tx: {
   data: string;
   value: bigint;
@@ -60,10 +52,8 @@ export function decodeSwap(tx: {
   if (!tx.data || tx.data.length < 10) {
     return { isSwap: false };
   }
-
   const selector = tx.data.slice(0, 10).toLowerCase();
   const protocol = SWAP_SELECTORS[selector];
-
   if (protocol) {
     if (selector === "0x04e45aaf") {
       try {
@@ -86,10 +76,8 @@ export function decodeSwap(tx: {
     }
     return { isSwap: true, protocol, selector };
   }
-
   if (tx.to && KNOWN_ROUTERS.has(tx.to.toLowerCase())) {
     return { isSwap: true, protocol: "Known Router", selector };
   }
-
   return { isSwap: false };
 }
