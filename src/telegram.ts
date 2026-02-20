@@ -9,31 +9,39 @@ let enabled = false;
 
 export function initTelegram(): void {
   botToken = process.env.TELEGRAM_BOT_TOKEN ?? "";
-  chatId   = process.env.TELEGRAM_CHAT_ID ?? "";
+  chatId = process.env.TELEGRAM_CHAT_ID ?? "";
 
   if (!botToken || !chatId) {
     logger.warn("⚠️  Telegram não configurado (TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID ausente)");
     return;
   }
+
   enabled = true;
   logger.info("📱 Telegram notificações ativadas");
 }
 
 async function send(text: string): Promise<void> {
   if (!enabled) return;
+
   try {
-    await axios.post(`${TG_API}/bot${botToken}/sendMessage`, {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    }, { timeout: 8000 });
+    await axios.post(
+      `${TG_API}/bot${botToken}/sendMessage`,
+      {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      },
+      { timeout: 8000 }
+    );
   } catch (err: any) {
-    logger.error(`❌ Falha ao enviar Telegram: ${err.message}`);
+    logger.error(`❌ Falha ao enviar Telegram: ${err?.response?.data?.description || err.message}`);
   }
 }
 
-// ─── NOTIFICAÇÕES ────────────────────────────────────────────────
+/* ──────────────────────────────────────────────── */
+/* NOTIFICAÇÕES                                   */
+/* ──────────────────────────────────────────────── */
 
 export async function notifyBuyExecuted(params: {
   whaleWallet: string;
@@ -46,9 +54,11 @@ export async function notifyBuyExecuted(params: {
   delayMs: number;
   gasCostEth?: number;
 }): Promise<void> {
-  const shortWallet = params.whaleWallet.slice(0, 6) + "..." + params.whaleWallet.slice(-4);
-  const shortToken  = params.tokenOut.slice(0, 6) + "..." + params.tokenOut.slice(-4);
-  const gasCost     = params.gasCostEth ? `${(params.gasCostEth * params.ethPriceUsd).toFixed(4)}` : "—";
+
+  const shortWallet = `${params.whaleWallet.slice(0, 6)}...${params.whaleWallet.slice(-4)}`;
+  const gasCost = params.gasCostEth
+    ? (params.gasCostEth * params.ethPriceUsd).toFixed(4)
+    : "—";
 
   const msg = [
     `🟢 <b>COMPRA EXECUTADA</b>`,
@@ -59,7 +69,7 @@ export async function notifyBuyExecuted(params: {
     `⚡ Delay: ${params.delayMs}ms`,
     `⛽ Gas: ~$${gasCost}`,
     ``,
-    `🔗 <a href="https://basescan.org/tx/${params.txHash}">Minha TX</a>  |  <a href="https://basescan.org/tx/${params.whaleTxHash}">TX da Whale</a>`,
+    `🔗 <a href="https://basescan.org/tx/${params.txHash}">Minha TX</a> | <a href="https://basescan.org/tx/${params.whaleTxHash}">TX da Whale</a>`,
     `📊 <a href="https://dexscreener.com/base/${params.tokenOut}">DexScreener</a>`,
   ].join("\n");
 
@@ -68,10 +78,11 @@ export async function notifyBuyExecuted(params: {
 
 export async function notifySellDetected(params: {
   whaleWallet: string;
-  tokenIn: string;   // token que a whale está vendendo (nosso tokenOut de entrada)
+  tokenIn: string;
   whaleTxHash: string;
 }): Promise<void> {
-  const shortWallet = params.whaleWallet.slice(0, 6) + "..." + params.whaleWallet.slice(-4);
+
+  const shortWallet = `${params.whaleWallet.slice(0, 6)}...${params.whaleWallet.slice(-4)}`;
 
   const msg = [
     `🔴 <b>WHALE VENDENDO</b>`,
@@ -93,7 +104,8 @@ export async function notifyBuyFailed(params: {
   reason: string;
   whaleTxHash: string;
 }): Promise<void> {
-  const shortWallet = params.whaleWallet.slice(0, 6) + "..." + params.whaleWallet.slice(-4);
+
+  const shortWallet = `${params.whaleWallet.slice(0, 6)}...${params.whaleWallet.slice(-4)}`;
 
   const msg = [
     `⚠️ <b>TRADE FALHOU</b>`,
@@ -113,6 +125,7 @@ export async function notifyInsufficientBalance(params: {
   requiredUsd: number;
   ethPriceUsd: number;
 }): Promise<void> {
+
   const requiredEth = (params.requiredUsd / params.ethPriceUsd).toFixed(6);
 
   const msg = [
@@ -128,7 +141,8 @@ export async function notifyInsufficientBalance(params: {
 }
 
 export async function notifyBotStarted(wallets: string[]): Promise<void> {
-  const walletList = wallets.map(w => `  • <code>${w}</code>`).join("\n");
+
+  const walletList = wallets.map(w => `• <code>${w}</code>`).join("\n");
 
   const msg = [
     `🚀 <b>Bot iniciado</b>`,
@@ -144,4 +158,56 @@ export async function notifyBotStarted(wallets: string[]): Promise<void> {
 
 export async function notifyBotStopped(): Promise<void> {
   await send(`⛔ <b>Bot encerrado.</b>`);
+}
+
+export async function notifySellExecuted(params: {
+  whaleWallet: string;
+  tokenIn: string;
+  receivedEth: number;
+  txHash: string;
+  whaleTxHash: string;
+  gasCostEth?: number;
+}): Promise<void> {
+
+  const shortWallet = `${params.whaleWallet.slice(0, 6)}...${params.whaleWallet.slice(-4)}`;
+  const ethPriceUsd = 2000;
+
+  const gasCost = params.gasCostEth
+    ? (params.gasCostEth * ethPriceUsd).toFixed(4)
+    : "—";
+
+  const msg = [
+    `🔴 <b>VENDA EXECUTADA</b>`,
+    ``,
+    `👤 Whale: <code>${shortWallet}</code>`,
+    `🪙 Token: <code>${params.tokenIn}</code>`,
+    `💰 Recebido: <b>${params.receivedEth.toFixed(6)} ETH</b> (~$${(params.receivedEth * ethPriceUsd).toFixed(2)})`,
+    `⛽ Gas: ~$${gasCost}`,
+    ``,
+    `🔗 <a href="https://basescan.org/tx/${params.txHash}">Minha TX</a> | <a href="https://basescan.org/tx/${params.whaleTxHash}">TX da Whale</a>`,
+  ].join("\n");
+
+  await send(msg);
+}
+
+export async function notifySellFailed(params: {
+  whaleWallet: string;
+  tokenIn: string;
+  reason: string;
+  whaleTxHash: string;
+}): Promise<void> {
+
+  const shortWallet = `${params.whaleWallet.slice(0, 6)}...${params.whaleWallet.slice(-4)}`;
+
+  const msg = [
+    `⚠️ <b>VENDA FALHOU</b>`,
+    ``,
+    `👤 Whale: <code>${shortWallet}</code>`,
+    `🪙 Token: <code>${params.tokenIn}</code>`,
+    `❌ Motivo: <code>${params.reason}</code>`,
+    ``,
+    `🔗 <a href="https://basescan.org/tx/${params.whaleTxHash}">TX da Whale</a>`,
+  ].join("\n");
+
+  await send(msg);
 }
