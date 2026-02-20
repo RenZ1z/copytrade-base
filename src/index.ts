@@ -31,11 +31,33 @@ const TARGET_WALLETS: string[] = process.env
 
 const TRADE_AMOUNT_USD = parseFloat(process.env.TRADE_AMOUNT_USD!);
 const WETH = process.env.WETH_ADDRESS!.toLowerCase();
-const ETH_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE".toLowerCase();
+const ETH_ADDRESS = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 const lastTrade: Map<string, number> = new Map();
 const COOLDOWN_MS = 10_000;
 const processedTxs = new Set<string>();
+
+// Mapa de posições abertas: whale -> Set de tokens comprados
+const openPositions: Map<string, Set<string>> = new Map();
+
+function addPosition(whaleAddress: string, tokenAddress: string) {
+  const addr = whaleAddress.toLowerCase();
+  const token = tokenAddress.toLowerCase();
+  if (!openPositions.has(addr)) openPositions.set(addr, new Set());
+  openPositions.get(addr)!.add(token);
+  logger.info(`📌 Posição registrada: ${token} (whale: ${addr})`);
+}
+
+function removePosition(whaleAddress: string, tokenAddress: string) {
+  const addr = whaleAddress.toLowerCase();
+  const token = tokenAddress.toLowerCase();
+  openPositions.get(addr)?.delete(token);
+  logger.info(`🗑️  Posição removida: ${token}`);
+}
+
+function getPositions(whaleAddress: string): string[] {
+  return Array.from(openPositions.get(whaleAddress.toLowerCase()) ?? []);
+}
 
 let httpProvider: ethers.JsonRpcProvider;
 let signer: ethers.Wallet;
@@ -44,6 +66,41 @@ let ws: WebSocket;
 function isEth(token: string): boolean {
   const t = token.toLowerCase();
   return t === WETH || t === ETH_ADDRESS;
+}
+
+async function resolveTokenOut(txHash: string, whaleFrom: string): Promise<string | null> {
+  let receipt = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    receipt = await httpProvider.getTransactionReceipt(txHash);
+    if (receipt) break;
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  if (!receipt) {
+    logger.warn(`⚠️  Receipt não encontrado após 20s para ${txHash}`);
+    return null;
+  }
+
+  const withdrawalTopic = ethers.id("Withdrawal(address,uint256)");
+  const withdrawalLog = receipt.logs.find(
+    (log) => log.topics[0] === withdrawalTopic && log.address.toLowerCase() === WETH
+  );
+  if (withdrawalLog) {
+    logger.info(`💰 WETH Withdrawal detectado - whale recebeu ETH nativo`);
+    return WETH;
+  }
+
+  const transferTopic = ethers.id("Transfer(address,address,uint256)");
+  const relevantLogs = receipt.logs.filter(
+    (log) =>
+      log.topics[0] === transferTopic &&
+      log.topics[2] &&
+      ethers.dataSlice(log.topics[2], 12).toLowerCase() === whaleFrom.toLowerCase()
+  );
+  if (relevantLogs.length === 0) {
+    logger.warn(`⚠️  Nenhum Transfer para ${whaleFrom} encontrado no receipt`);
+    return null;
+  }
+  return relevantLogs[relevantLogs.length - 1].address;
 }
 
 async function handleSwap(tx: {
@@ -56,44 +113,51 @@ async function handleSwap(tx: {
   const from = tx.from.toLowerCase();
 
   if (isEth(tokenOut)) {
-    logger.info(`🔔 WHALE VENDEU! Copiando venda...`);
+    logger.info(`🔔 WHALE VENDEU! Verificando posições abertas...`);
+    const positions = getPositions(from);
+    logger.info(`📋 Posições abertas pra ${from}: [${positions.join(', ') || 'nenhuma'}]`);
 
-    const tokenInFromReceipt = await resolveTokenIn(tx.hash, from);
-    if (!tokenInFromReceipt) {
-      logger.warn(`⚠️  Não foi possível identificar qual token a whale vendeu`);
+    if (positions.length === 0) {
+      logger.info(`⏭️  Sem posições abertas pra vender`);
       await notifySellDetected({ whaleWallet: from, tokenIn: "unknown", whaleTxHash: tx.hash });
       return;
     }
 
-    const result = await executeCopySell({
-      tokenIn: tokenInFromReceipt,
-      walletAddress: process.env.MY_WALLET_ADDRESS!,
-      signer,
-      provider: httpProvider,
-    });
+    for (const tokenIn of positions) {
+      logger.info(`💸 Vendendo posição: ${tokenIn}`);
+      const result = await executeCopySell({
+        tokenIn,
+        walletAddress: process.env.MY_WALLET_ADDRESS!,
+        signer,
+        provider: httpProvider,
+      });
 
-    if (result.status === "success" && result.txHash) {
-      await notifySellExecuted({
-        whaleWallet: from,
-        tokenIn: tokenInFromReceipt,
-        receivedEth: result.sellAmountEth,
-        txHash: result.txHash,
-        whaleTxHash: tx.hash,
-        gasCostEth: result.gasCostEth,
-      });
-    } else if (result.status === "skipped") {
-      await notifySellDetected({ whaleWallet: from, tokenIn: tokenInFromReceipt, whaleTxHash: tx.hash });
-    } else {
-      await notifySellFailed({
-        whaleWallet: from,
-        tokenIn: tokenInFromReceipt,
-        reason: result.errorMsg ?? "unknown",
-        whaleTxHash: tx.hash,
-      });
+      if (result.status === "success" && result.txHash) {
+        removePosition(from, tokenIn);
+        await notifySellExecuted({
+          whaleWallet: from,
+          tokenIn,
+          receivedEth: result.sellAmountEth,
+          txHash: result.txHash,
+          whaleTxHash: tx.hash,
+          gasCostEth: result.gasCostEth,
+        });
+      } else if (result.status === "skipped") {
+        removePosition(from, tokenIn);
+        logger.info(`⏭️  Sem saldo de ${tokenIn}, removendo posição`);
+      } else {
+        await notifySellFailed({
+          whaleWallet: from,
+          tokenIn,
+          reason: result.errorMsg ?? "unknown",
+          whaleTxHash: tx.hash,
+        });
+      }
     }
     return;
   }
 
+  // COMPRA
   const now = Date.now();
   const lastTime = lastTrade.get(from) ?? 0;
   if (now - lastTime < COOLDOWN_MS) {
@@ -123,6 +187,7 @@ async function handleSwap(tx: {
   });
 
   if (result.status === "success" && result.txHash) {
+    addPosition(from, tokenOut);
     await notifyBuyExecuted({
       whaleWallet: from,
       tokenOut,
@@ -142,75 +207,6 @@ async function handleSwap(tx: {
       whaleTxHash: tx.hash,
     });
   }
-}
-
-async function resolveTokenOut(txHash: string, whaleFrom: string): Promise<string | null> {
-  let receipt = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    receipt = await httpProvider.getTransactionReceipt(txHash);
-    if (receipt) break;
-    await new Promise(r => setTimeout(r, 2000));
-  }
-
-  if (!receipt) {
-    logger.warn(`⚠️  Receipt não encontrado após 20s para ${txHash}`);
-    return null;
-  }
-
-  const transferTopic = ethers.id("Transfer(address,address,uint256)");
-  const withdrawalTopic = ethers.id("Withdrawal(address,uint256)");
-
-  const withdrawalLog = receipt.logs.find(
-    (log) => log.topics[0] === withdrawalTopic && log.address.toLowerCase() === WETH
-  );
-  if (withdrawalLog) {
-    logger.info(`💰 WETH Withdrawal detectado - whale recebeu ETH nativo`);
-    return WETH;
-  }
-
-  const relevantLogs = receipt.logs.filter(
-    (log) =>
-      log.topics[0] === transferTopic &&
-      log.topics[2] &&
-      ethers.dataSlice(log.topics[2], 12).toLowerCase() === whaleFrom.toLowerCase()
-  );
-
-  if (relevantLogs.length === 0) {
-    logger.warn(`⚠️  Nenhum Transfer para ${whaleFrom} encontrado no receipt`);
-    return null;
-  }
-
-  return relevantLogs[relevantLogs.length - 1].address;
-}
-
-async function resolveTokenIn(txHash: string, whaleFrom: string): Promise<string | null> {
-  let receipt = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    receipt = await httpProvider.getTransactionReceipt(txHash);
-    if (receipt) break;
-    await new Promise(r => setTimeout(r, 2000));
-  }
-
-  if (!receipt) {
-    logger.warn(`⚠️  Receipt não encontrado após 20s para ${txHash}`);
-    return null;
-  }
-
-  const transferTopic = ethers.id("Transfer(address,address,uint256)");
-
-  const relevantLogs = receipt.logs.filter(
-    (log) =>
-      log.topics[0] === transferTopic &&
-      log.topics[1] &&
-      ethers.dataSlice(log.topics[1], 12).toLowerCase() === whaleFrom.toLowerCase()
-  );
-
-  if (relevantLogs.length === 0) {
-    logger.warn(`⚠️  Nenhum Transfer DE ${whaleFrom} encontrado no receipt`);
-    return null;
-  }
-
-  return relevantLogs[0].address;
 }
 
 async function handlePendingTx(tx: {
@@ -278,13 +274,11 @@ function connectWS(): void {
   ws.on("message", async (raw: WebSocket.RawData) => {
     try {
       const msg = JSON.parse(raw.toString());
-
       if (msg.id === 1 && msg.result) {
         blockSubId = msg.result;
         logger.info(`📡 Block sub ID: ${blockSubId}`);
         return;
       }
-
       if (!msg.params?.subscription || msg.params.subscription !== blockSubId) return;
 
       const blockHash = msg.params.result?.hash;
@@ -308,7 +302,6 @@ function connectWS(): void {
       for (const tx of txs) {
         if (!tx?.from) continue;
         const from = (tx.from as string).toLowerCase();
-
         if (TARGET_WALLETS.includes(from)) {
           handlePendingTx({
             hash: tx.hash,
@@ -325,18 +318,14 @@ function connectWS(): void {
   });
 
   ws.on("error", (err) => logger.error(`❌ WebSocket error: ${err.message}`));
-
   ws.on("close", () => {
     logger.warn("🔌 WebSocket desconectado, reconectando em 3s...");
     setTimeout(connectWS, 3000);
   });
 
   const heartbeat = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    } else {
-      clearInterval(heartbeat);
-    }
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+    else clearInterval(heartbeat);
   }, 30_000);
 }
 
@@ -351,10 +340,8 @@ async function startMonitor(): Promise<void> {
   signer = new ethers.Wallet(process.env.MY_PRIVATE_KEY!, httpProvider);
 
   logger.info(`🔑 Bot wallet: ${await signer.getAddress()}`);
-
   const balance = await httpProvider.getBalance(signer.getAddress());
   logger.info(`💰 Saldo ETH: ${ethers.formatEther(balance)} ETH`);
-
   if (balance < ethers.parseEther("0.005")) {
     logger.warn("⚠️  Saldo baixo! Mantenha pelo menos 0.005 ETH para gas");
   }
