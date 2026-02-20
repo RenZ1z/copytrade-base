@@ -346,8 +346,9 @@ function cleanExpiredPending(): void {
 }
 
 // ─────────────────────────────────────────────
-// WEBSOCKET RAW — usa alchemy_pendingTransactions
-// ethers.js não suporta esse método nativamente
+// WEBSOCKET RAW — monitora blocos confirmados
+// alchemy_pendingTransactions não é confiável na Base
+// pois o sequencer não expõe mempool padrão
 // ─────────────────────────────────────────────
 function connectWS(): void {
   logger.info("🔌 Conectando ao WebSocket da Alchemy...");
@@ -357,49 +358,26 @@ function connectWS(): void {
     wsReady = true;
     logger.info("✅ WebSocket conectado");
 
-    // Subscreve em pending TXs das wallets alvo via alchemy_pendingTransactions
-    // Esse método filtra diretamente no lado do Alchemy — não recebe lixo
-    const pendingSubPayload = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_subscribe",
-      params: [
-        "alchemy_pendingTransactions",
-        {
-          fromAddress: TARGET_WALLETS,
-          hashesOnly: false, // recebe a TX completa, não só o hash
-        },
-      ],
-    };
-    ws.send(JSON.stringify(pendingSubPayload));
-
-    // Subscreve em novos blocos para resolver pendingTrades
+    // Na Base, o sequencer centralizado não expõe mempool público
+    // então monitoramos blocos confirmados (~2s de delay) que é garantido
     const blockSubPayload = {
       jsonrpc: "2.0",
-      id: 2,
+      id: 1,
       method: "eth_subscribe",
       params: ["newHeads"],
     };
     ws.send(JSON.stringify(blockSubPayload));
 
-    logger.info(`👀 Monitorando mempool de ${TARGET_WALLETS.length} wallet(s)`);
+    logger.info(`👀 Monitorando blocos para ${TARGET_WALLETS.length} wallet(s)`);
   });
 
-  // IDs de subscrição retornados pelo Alchemy
-  let pendingSubId: string | null = null;
   let blockSubId: string | null = null;
 
   ws.on("message", async (raw: WebSocket.RawData) => {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // Resposta da subscrição — captura os IDs
       if (msg.id === 1 && msg.result) {
-        pendingSubId = msg.result;
-        logger.info(`📡 Pending sub ID: ${pendingSubId}`);
-        return;
-      }
-      if (msg.id === 2 && msg.result) {
         blockSubId = msg.result;
         logger.info(`📡 Block sub ID: ${blockSubId}`);
         return;
@@ -407,34 +385,37 @@ function connectWS(): void {
 
       if (!msg.params?.subscription) return;
 
-      // Evento de pending TX
-      if (msg.params.subscription === pendingSubId) {
-        const tx = msg.params.result;
-        if (tx?.hash && tx?.from) {
-          handlePendingTx(tx).catch((err) =>
-            logger.error(`Erro no handler pending: ${err.message}`)
-          );
-        }
-        return;
-      }
-
-      // Evento de novo bloco — processa confirmações de pendingTrades
+      // Novo bloco confirmado — varre todas as TXs
       if (msg.params.subscription === blockSubId) {
-        // Limpa expirados
         cleanExpiredPending();
 
-        if (pendingTrades.size === 0) return;
-
-        // Busca o bloco completo para varrer as TXs confirmadas
         const blockHash = msg.params.result?.hash;
         if (!blockHash) return;
 
-        const block = await httpProvider.getBlock(blockHash, false);
+        // Busca bloco com TXs completas (true = incluir txs)
+        const block = await httpProvider.getBlock(blockHash, true);
         if (!block?.transactions) return;
 
-        for (const txHash of block.transactions) {
-          if (pendingTrades.has(txHash)) {
-            handleConfirmedTx(txHash).catch((err) =>
+        for (const tx of block.transactions) {
+          if (typeof tx === "string") continue;
+          if (!tx.from) continue;
+          const from = tx.from.toLowerCase();
+
+          if (TARGET_WALLETS.includes(from)) {
+            // TX de uma wallet alvo confirmada no bloco
+            // Usa o fluxo de handlePendingTx mas com dados já completos
+            handlePendingTx({
+              hash: tx.hash,
+              from: tx.from,
+              to: tx.to,
+              input: tx.data,
+              value: tx.value.toString(),
+            }).catch((err) =>
+              logger.error(`Erro no handler tx: ${err.message}`)
+            );
+          } else if (pendingTrades.has(tx.hash)) {
+            // TX que estava aguardando confirmação para pegar tokenOut via receipt
+            handleConfirmedTx(tx.hash).catch((err) =>
               logger.error(`Erro no handler confirmed: ${err.message}`)
             );
           }
