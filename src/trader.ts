@@ -2,8 +2,9 @@ import axios from "axios";
 import { ethers } from "ethers";
 import { logger } from "./logger";
 
-const ZEROX_QUOTE_URL = "https://api.0x.org/swap/permit2/quote ";
-const ZEROX_APPROVE_URL = "https://api.0x.org/swap/permit2/approve ";
+const ZEROX_PRICE_URL = "https://api.0x.org/swap/allowance-holder/price";
+const ZEROX_QUOTE_URL = "https://api.0x.org/swap/allowance-holder/quote";
+const ALLOWANCE_HOLDER = "0x0000000000001fF3684f28c67538d4D072C22734"; // Confirma esse endereço!
 const WETH = process.env.WETH_ADDRESS!;
 const ETH_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
@@ -27,7 +28,7 @@ let ethPriceUsd = 2000;
 async function getEthPrice(): Promise<number> {
   try {
     const res = await axios.get(
-      "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd ",
+      "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
       { timeout: 5000 }
     );
     ethPriceUsd = res.data?.ethereum?.usd ?? 2000;
@@ -47,6 +48,52 @@ async function sendAndWait(signer: ethers.Wallet, tx: { to: string; data: string
   return await sent.wait();
 }
 
+// Helper pra verificar e fazer approve se necessário
+async function checkAndApproveToken(
+  tokenAddress: string,
+  amount: string,
+  signer: ethers.Wallet,
+  provider: ethers.JsonRpcProvider
+): Promise<boolean> {
+  try {
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      [
+        "function allowance(address owner, address spender) view returns (uint256)",
+        "function approve(address spender, uint256 amount) returns (bool)"
+      ],
+      signer
+    );
+
+    const owner = await signer.getAddress();
+    const currentAllowance = await tokenContract.allowance(owner, ALLOWANCE_HOLDER);
+    const amountBigInt = BigInt(amount);
+
+    if (currentAllowance < amountBigInt) {
+      logger.info(`📝 Fazendo approve de ${tokenAddress} pro AllowanceHolder...`);
+
+      const tx = await tokenContract.approve(ALLOWANCE_HOLDER, amountBigInt);
+      const receipt = await tx.wait();
+
+      if (receipt?.status === 1) {
+        logger.info(`✅ Aprovação confirmada: ${receipt.hash}`);
+        // Espera um pouco pra garantir que a allowance foi atualizada na chain
+        await new Promise(r => setTimeout(r, 2000));
+        return true;
+      } else {
+        logger.error(`❌ Aprovação revertida`);
+        return false;
+      }
+    }
+
+    logger.info(`✅ Já tem allowance suficiente`);
+    return true;
+  } catch (err: any) {
+    logger.error(`❌ Erro no approve: ${err.message}`);
+    return false;
+  }
+}
+
 export async function executeCopyTrade(params: {
   tokenOut: string;
   amountUsd: number;
@@ -62,6 +109,27 @@ export async function executeCopyTrade(params: {
   logger.info(`💱 [BUY] Cotando: ${ethAmount.toFixed(6)} ETH (~$${amountUsd}) -> ${tokenOut}`);
 
   try {
+    // Primeiro pega o price pra ver se tem liquidez
+    const priceRes = await axios.get(ZEROX_PRICE_URL, {
+      headers: {
+        "0x-api-key": process.env.ZEROX_API_KEY!,
+        "0x-version": "v2",
+      },
+      params: {
+        chainId: 8453,
+        sellToken: ETH_ADDRESS,
+        buyToken: tokenOut,
+        sellAmount,
+        taker: walletAddress,
+      },
+      timeout: 10000,
+    });
+
+    if (!priceRes.data?.liquidityAvailable) {
+      return { status: "failed", sellAmountEth: ethAmount, ethPriceUsd: price, errorMsg: "Sem liquidez disponível" };
+    }
+
+    // Agora pega o quote firm
     const quoteRes = await axios.get(ZEROX_QUOTE_URL, {
       headers: {
         "0x-api-key": process.env.ZEROX_API_KEY!,
@@ -95,7 +163,18 @@ export async function executeCopyTrade(params: {
 
       logger.info(`✅ BUY confirmada no bloco ${receipt.blockNumber} (gas: ${gasUsed})`);
 
-      return { status: "success", txHash: receipt.hash, blockNumber: receipt.blockNumber, buyAmountRaw: quote.buyAmount, sellAmountEth: ethAmount, ethPriceUsd: price, gasUsed, gasPriceGwei, gasCostEth, confirmedAtMs };
+      return {
+        status: "success",
+        txHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        buyAmountRaw: quote.buyAmount,
+        sellAmountEth: ethAmount,
+        ethPriceUsd: price,
+        gasUsed,
+        gasPriceGwei,
+        gasCostEth,
+        confirmedAtMs
+      };
     } else {
       logger.error(`❌ BUY revertida`);
       return { status: "failed", sellAmountEth: ethAmount, ethPriceUsd: price, confirmedAtMs, errorMsg: "tx reverted" };
@@ -118,7 +197,7 @@ export async function executeCopySell(params: {
 
   const tokenContract = new ethers.Contract(
     tokenIn,
-    ["function balanceOf(address) view returns (uint256)"],
+    ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)"],
     provider
   );
 
@@ -128,9 +207,40 @@ export async function executeCopySell(params: {
     return { status: "skipped", skipReason: "no_balance", sellAmountEth: 0, ethPriceUsd: price };
   }
 
-  logger.info(`💱 [SELL] Cotando: ${balance.toString()} ${tokenIn} -> ETH`);
+  const decimals = await tokenContract.decimals().catch(() => 18);
+  logger.info(`💱 [SELL] Cotando: ${ethers.formatUnits(balance, decimals)} tokens (${tokenIn}) -> ETH`);
 
   try {
+    // Primeiro pega o price pra verificar issues
+    const priceRes = await axios.get(ZEROX_PRICE_URL, {
+      headers: {
+        "0x-api-key": process.env.ZEROX_API_KEY!,
+        "0x-version": "v2",
+      },
+      params: {
+        chainId: 8453,
+        sellToken: tokenIn,
+        buyToken: ETH_ADDRESS,
+        sellAmount: balance.toString(),
+        taker: walletAddress,
+      },
+      timeout: 10000,
+    });
+
+    logger.info(`📋 Price response keys: ${Object.keys(priceRes.data).join(', ')}`);
+
+    // Verifica se precisa de allowance e faz approve ANTES do quote
+    if (priceRes.data?.issues?.allowance) {
+      const allowanceInfo = priceRes.data.issues.allowance;
+      logger.info(`⚠️  Allowance necessária: ${JSON.stringify(allowanceInfo)}`);
+
+      const approved = await checkAndApproveToken(tokenIn, balance.toString(), signer, provider);
+      if (!approved) {
+        return { status: "failed", sellAmountEth: 0, ethPriceUsd: price, errorMsg: "Falha na aprovação do token" };
+      }
+    }
+
+    // Agora pega o quote firm (depois do approve)
     const quoteRes = await axios.get(ZEROX_QUOTE_URL, {
       headers: {
         "0x-api-key": process.env.ZEROX_API_KEY!,
@@ -148,51 +258,16 @@ export async function executeCopySell(params: {
     });
 
     const quote = quoteRes.data;
-    logger.info(`📋 0x quote response keys: ${Object.keys(quote).join(', ')}`);
-
-    if (quote.approval) {
-      logger.info(`📝 Approval needed: ${JSON.stringify(quote.approval)}`);
-      const approveRes = await axios.get(ZEROX_APPROVE_URL, {
-        headers: {
-          "0x-api-key": process.env.ZEROX_API_KEY!,
-          "0x-version": "v2",
-        },
-        params: {
-          chainId: 8453,
-          token: tokenIn,
-          amount: balance.toString(),
-        },
-        timeout: 10000,
-      });
-
-      logger.info(`📋 Approve response: ${JSON.stringify(approveRes.data)}`);
-
-      if (approveRes.data?.data && approveRes.data?.to) {
-        const approveTx = {
-          to: approveRes.data.to,
-          data: approveRes.data.data,
-          value: "0",
-          gas: approveRes.data.gas ?? "100000",
-        };
-
-        const approveReceipt = await sendAndWait(signer, approveTx);
-        if (approveReceipt?.status !== 1) {
-          return { status: "failed", sellAmountEth: 0, ethPriceUsd: price, errorMsg: "approval tx reverted" };
-        }
-        logger.info(`✅ Aprovação confirmada`);
-
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
+    logger.info(`📋 Quote response keys: ${Object.keys(quote).join(', ')}`);
 
     if (!quote?.transaction) {
       logger.error(`❌ No transaction in quote. Full response: ${JSON.stringify(quote)}`);
       return { status: "failed", sellAmountEth: 0, ethPriceUsd: price, errorMsg: "0x API returned no transaction" };
     }
 
-    logger.info(`📋 Transaction to send: to=${quote.transaction.to}, data=${quote.transaction.data?.slice(0, 20)}..., value=${quote.transaction.value}`);
+    logger.info(`📋 Transaction to send: to=${quote.transaction.to}, data=${quote.transaction.data?.slice(0, 30)}..., value=${quote.transaction.value}`);
 
-    const buyAmountEth = parseFloat(ethers.formatEther(quote.buyAmount));
+    const buyAmountEth = parseFloat(ethers.formatEther(quote.buyAmount || "0"));
 
     const receipt = await sendAndWait(signer, quote.transaction);
     const confirmedAtMs = Date.now();
@@ -204,7 +279,17 @@ export async function executeCopySell(params: {
 
       logger.info(`✅ SELL confirmada no bloco ${receipt.blockNumber} (gas: ${gasUsed})`);
 
-      return { status: "success", txHash: receipt.hash, blockNumber: receipt.blockNumber, sellAmountEth: buyAmountEth, ethPriceUsd: price, gasUsed, gasPriceGwei, gasCostEth, confirmedAtMs };
+      return {
+        status: "success",
+        txHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        sellAmountEth: buyAmountEth,
+        ethPriceUsd: price,
+        gasUsed,
+        gasPriceGwei,
+        gasCostEth,
+        confirmedAtMs
+      };
     } else {
       logger.error(`❌ SELL revertida`);
       return { status: "failed", sellAmountEth: 0, ethPriceUsd: price, confirmedAtMs, errorMsg: "tx reverted" };
