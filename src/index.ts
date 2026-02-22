@@ -33,24 +33,30 @@ const TRADE_AMOUNT_USD = parseFloat(process.env.TRADE_AMOUNT_USD!);
 const WETH = process.env.WETH_ADDRESS!.toLowerCase();
 const ETH_ADDRESS = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
-const lastTrade: Map<string, number> = new Map();
-const COOLDOWN_MS = 10_000;
 const processedTxs = new Set<string>();
 
 // ─────────────────────────────────────────────
-// POSIÇÕES ABERTAS COM PERSISTÊNCIA EM ARQUIVO
+// ESTRUTURA DE POSIÇÕES — FIFO por token
 // ─────────────────────────────────────────────
+interface Position {
+  token: string;
+  whaleTx: string;
+  myTx: string;
+  amountUsd: number;
+  timestamp: number;
+}
+
 const POSITIONS_FILE = "data/positions.json";
 
-function loadPositions(): Map<string, Set<string>> {
+function loadPositions(): Map<string, Position[]> {
   try {
     if (!fs.existsSync("data")) fs.mkdirSync("data");
     if (!fs.existsSync(POSITIONS_FILE)) return new Map();
     const raw = fs.readFileSync(POSITIONS_FILE, "utf-8");
-    const obj: Record<string, string[]> = JSON.parse(raw);
-    const map = new Map<string, Set<string>>();
-    for (const [whale, tokens] of Object.entries(obj)) {
-      map.set(whale, new Set(tokens));
+    const obj: Record<string, Position[]> = JSON.parse(raw);
+    const map = new Map<string, Position[]>();
+    for (const [whale, positions] of Object.entries(obj)) {
+      map.set(whale, positions);
     }
     logger.info(`📂 Posições carregadas do disco: ${JSON.stringify(obj)}`);
     return map;
@@ -60,12 +66,12 @@ function loadPositions(): Map<string, Set<string>> {
   }
 }
 
-function savePositions(map: Map<string, Set<string>>) {
+function savePositions(map: Map<string, Position[]>) {
   try {
     if (!fs.existsSync("data")) fs.mkdirSync("data");
-    const obj: Record<string, string[]> = {};
-    for (const [whale, tokens] of map.entries()) {
-      if (tokens.size > 0) obj[whale] = Array.from(tokens);
+    const obj: Record<string, Position[]> = {};
+    for (const [whale, positions] of map.entries()) {
+      if (positions.length > 0) obj[whale] = positions;
     }
     fs.writeFileSync(POSITIONS_FILE, JSON.stringify(obj, null, 2));
   } catch (err: any) {
@@ -73,27 +79,47 @@ function savePositions(map: Map<string, Set<string>>) {
   }
 }
 
-const openPositions: Map<string, Set<string>> = loadPositions();
+const openPositions: Map<string, Position[]> = loadPositions();
 
-function addPosition(whaleAddress: string, tokenAddress: string) {
+function addPosition(whaleAddress: string, position: Position) {
   const addr = whaleAddress.toLowerCase();
-  const token = tokenAddress.toLowerCase();
-  if (!openPositions.has(addr)) openPositions.set(addr, new Set());
-  openPositions.get(addr)!.add(token);
+  if (!openPositions.has(addr)) openPositions.set(addr, []);
+  openPositions.get(addr)!.push(position);
   savePositions(openPositions);
-  logger.info(`📌 Posição registrada: ${token} (whale: ${addr})`);
+  logger.info(`📌 Posição registrada: ${position.token} (whale: ${addr}) [total: ${openPositions.get(addr)!.length}]`);
 }
 
-function removePosition(whaleAddress: string, tokenAddress: string) {
+// Remove a primeira posição do token (FIFO) e retorna ela
+function popPosition(whaleAddress: string, token: string): Position | null {
   const addr = whaleAddress.toLowerCase();
-  const token = tokenAddress.toLowerCase();
-  openPositions.get(addr)?.delete(token);
+  const tok = token.toLowerCase();
+  const positions = openPositions.get(addr);
+  if (!positions) return null;
+  const idx = positions.findIndex(p => p.token === tok);
+  if (idx === -1) return null;
+  const [removed] = positions.splice(idx, 1);
   savePositions(openPositions);
-  logger.info(`🗑️  Posição removida: ${token}`);
+  logger.info(`🗑️  Posição removida: ${tok} (whale: ${addr}) [restantes: ${positions.filter(p => p.token === tok).length}]`);
+  return removed;
 }
 
-function getPositions(whaleAddress: string): string[] {
-  return Array.from(openPositions.get(whaleAddress.toLowerCase()) ?? []);
+// Retorna todas as posições de um token específico
+function getPositionsForToken(whaleAddress: string, token: string): Position[] {
+  const addr = whaleAddress.toLowerCase();
+  const tok = token.toLowerCase();
+  return (openPositions.get(addr) ?? []).filter(p => p.token === tok);
+}
+
+// Retorna tokens únicos com posição aberta
+function getUniqueTokens(whaleAddress: string): string[] {
+  const addr = whaleAddress.toLowerCase();
+  const positions = openPositions.get(addr) ?? [];
+  return [...new Set(positions.map(p => p.token))];
+}
+
+// Conta quantas posições abertas tem de um token
+function countPositions(whaleAddress: string, token: string): number {
+  return getPositionsForToken(whaleAddress, token).length;
 }
 
 let httpProvider: ethers.JsonRpcProvider;
@@ -105,7 +131,7 @@ function isEth(token: string): boolean {
   return t === WETH || t === ETH_ADDRESS;
 }
 
-async function resolveTokenOut(txHash: string, whaleFrom: string): Promise<string | null> {
+async function resolveSwapInfo(txHash: string, whaleFrom: string): Promise<{ tokenSold: string | null; isEthOut: boolean }> {
   let receipt = null;
   for (let attempt = 0; attempt < 10; attempt++) {
     receipt = await httpProvider.getTransactionReceipt(txHash);
@@ -114,30 +140,50 @@ async function resolveTokenOut(txHash: string, whaleFrom: string): Promise<strin
   }
   if (!receipt) {
     logger.warn(`⚠️  Receipt não encontrado após 20s para ${txHash}`);
-    return null;
-  }
-
-  const withdrawalTopic = ethers.id("Withdrawal(address,uint256)");
-  const withdrawalLog = receipt.logs.find(
-    (log) => log.topics[0] === withdrawalTopic && log.address.toLowerCase() === WETH
-  );
-  if (withdrawalLog) {
-    logger.info(`💰 WETH Withdrawal detectado - whale recebeu ETH nativo`);
-    return WETH;
+    return { tokenSold: null, isEthOut: false };
   }
 
   const transferTopic = ethers.id("Transfer(address,address,uint256)");
-  const relevantLogs = receipt.logs.filter(
+  const withdrawalTopic = ethers.id("Withdrawal(address,uint256)");
+
+  const isEthOut = receipt.logs.some(
+    (log) => log.topics[0] === withdrawalTopic && log.address.toLowerCase() === WETH
+  );
+
+  // Token que SAIU da whale (ela vendeu)
+  const soldLog = receipt.logs.find(
+    (log) =>
+      log.topics[0] === transferTopic &&
+      log.topics[1] &&
+      ethers.dataSlice(log.topics[1], 12).toLowerCase() === whaleFrom.toLowerCase() &&
+      log.address.toLowerCase() !== WETH
+  );
+
+  // Token que ENTROU na whale (ela comprou)
+  const boughtLog = receipt.logs.find(
     (log) =>
       log.topics[0] === transferTopic &&
       log.topics[2] &&
-      ethers.dataSlice(log.topics[2], 12).toLowerCase() === whaleFrom.toLowerCase()
+      ethers.dataSlice(log.topics[2], 12).toLowerCase() === whaleFrom.toLowerCase() &&
+      log.address.toLowerCase() !== WETH
   );
-  if (relevantLogs.length === 0) {
-    logger.warn(`⚠️  Nenhum Transfer para ${whaleFrom} encontrado no receipt`);
-    return null;
+
+  if (isEthOut && soldLog) {
+    logger.info(`💰 Whale vendeu ${soldLog.address} → ETH`);
+    return { tokenSold: soldLog.address.toLowerCase(), isEthOut: true };
   }
-  return relevantLogs[relevantLogs.length - 1].address;
+
+  if (isEthOut && !soldLog) {
+    logger.warn(`⚠️  WETH withdrawal detectado mas tokenSold não identificado — fallback`);
+    return { tokenSold: null, isEthOut: true };
+  }
+
+  if (boughtLog) {
+    return { tokenSold: null, isEthOut: false };
+  }
+
+  logger.warn(`⚠️  Não foi possível identificar swap no receipt de ${txHash}`);
+  return { tokenSold: null, isEthOut: false };
 }
 
 async function handleSwap(tx: {
@@ -146,31 +192,51 @@ async function handleSwap(tx: {
   to: string | null;
   input: string;
   value: string;
-}, tokenOut: string): Promise<void> {
+}, tokenOut: string, tokenSold?: string | null): Promise<void> {
   const from = tx.from.toLowerCase();
 
   if (isEth(tokenOut)) {
     logger.info(`🔔 WHALE VENDEU! Verificando posições abertas...`);
-    const positions = getPositions(from);
-    logger.info(`📋 Posições abertas pra ${from}: [${positions.join(', ') || 'nenhuma'}]`);
 
-    if (positions.length === 0) {
-      logger.info(`⏭️  Sem posições abertas pra vender`);
+    // Determina quais tokens vender
+    let tokensToSell: string[];
+    if (tokenSold) {
+      const count = countPositions(from, tokenSold);
+      if (count === 0) {
+        // Whale vendeu token que não temos (compra falhou ou nunca comprou)
+        // → NOTIFICA qual token foi vendido, mas NÃO vende nada
+        logger.info(`⏭️  Whale vendeu ${tokenSold} mas não temos posição`);
+        await notifySellDetected({ whaleWallet: from, tokenIn: tokenSold, whaleTxHash: tx.hash });
+        return;
+      }
+      logger.info(`🎯 Venda específica: ${tokenSold} (${count} posição(ões) abertas)`);
+      tokensToSell = [tokenSold];
+    } else {
+      // tokenSold === null (não conseguiu identificar o que a whale vendeu)
+      // → NOTIFICA no telegram, mas NÃO vende nada automaticamente
+      logger.warn(`⚠️  Token vendido não identificado, avisando no telegram`);
       await notifySellDetected({ whaleWallet: from, tokenIn: "unknown", whaleTxHash: tx.hash });
       return;
     }
 
-    for (const tokenIn of positions) {
-      logger.info(`💸 Vendendo posição: ${tokenIn}`);
+    for (const tokenIn of tokensToSell) {
+      const remaining = countPositions(from, tokenIn);
+      logger.info(`💸 Vendendo 1 de ${remaining} posição(ões) de ${tokenIn}`);
+
+      // Calcula fração a vender: 1/remaining do saldo atual
+      const fraction = 1 / remaining;
+      logger.info(`📊 Fração a vender: ${(fraction * 100).toFixed(1)}% do saldo`);
+
       const result = await executeCopySell({
         tokenIn,
         walletAddress: process.env.MY_WALLET_ADDRESS!,
         signer,
         provider: httpProvider,
+        fraction, // nova prop
       });
 
       if (result.status === "success" && result.txHash) {
-        removePosition(from, tokenIn);
+        popPosition(from, tokenIn);
         await notifySellExecuted({
           whaleWallet: from,
           tokenIn,
@@ -180,7 +246,7 @@ async function handleSwap(tx: {
           gasCostEth: result.gasCostEth,
         });
       } else if (result.status === "skipped") {
-        removePosition(from, tokenIn);
+        popPosition(from, tokenIn);
         logger.info(`⏭️  Sem saldo de ${tokenIn}, removendo posição`);
       } else {
         await notifySellFailed({
@@ -196,12 +262,6 @@ async function handleSwap(tx: {
 
   // COMPRA
   const now = Date.now();
-  const lastTime = lastTrade.get(from) ?? 0;
-  if (now - lastTime < COOLDOWN_MS) {
-    logger.warn(`⏳ Cooldown ativo para ${from}, ignorando compra`);
-    return;
-  }
-  lastTrade.set(from, now);
 
   const balance = await httpProvider.getBalance(process.env.MY_WALLET_ADDRESS!);
   const requiredEth = (TRADE_AMOUNT_USD / 2000) * 1.05;
@@ -224,7 +284,13 @@ async function handleSwap(tx: {
   });
 
   if (result.status === "success" && result.txHash) {
-    addPosition(from, tokenOut);
+    addPosition(from, {
+      token: tokenOut.toLowerCase(),
+      whaleTx: tx.hash,
+      myTx: result.txHash,
+      amountUsd: TRADE_AMOUNT_USD,
+      timestamp: now,
+    });
     await notifyBuyExecuted({
       whaleWallet: from,
       tokenOut,
@@ -273,22 +339,36 @@ async function handlePendingTx(tx: {
   logger.info(`🔄 Swap no mempool via ${swap.protocol}`);
   processedTxs.add(tx.hash);
 
-  if (swap.tokenOut) {
-    await handleSwap(tx, swap.tokenOut);
-  } else {
-    logger.info(`⏳ tokenOut não decodificável, aguardando receipt em 3s...`);
-    setTimeout(async () => {
-      try {
-        const tokenOut = await resolveTokenOut(tx.hash, from);
-        if (tokenOut) {
-          logger.info(`🪙 tokenOut resolvido via receipt: ${tokenOut}`);
-          await handleSwap(tx, tokenOut);
+  logger.info(`⏳ Aguardando receipt em 3s...`);
+  setTimeout(async () => {
+    try {
+      const { tokenSold, isEthOut } = await resolveSwapInfo(tx.hash, from);
+
+      if (isEthOut) {
+        await handleSwap(tx, WETH, tokenSold);
+      } else {
+        // Compra: identifica token via receipt
+        const receipt = await httpProvider.getTransactionReceipt(tx.hash);
+        if (!receipt) return;
+        const transferTopic = ethers.id("Transfer(address,address,uint256)");
+        const boughtLog = receipt.logs.find(
+          (log) =>
+            log.topics[0] === transferTopic &&
+            log.topics[2] &&
+            ethers.dataSlice(log.topics[2], 12).toLowerCase() === from &&
+            log.address.toLowerCase() !== WETH
+        );
+        if (boughtLog) {
+          logger.info(`🪙 Token comprado identificado: ${boughtLog.address}`);
+          await handleSwap(tx, boughtLog.address, null);
+        } else {
+          logger.warn(`⚠️  Não foi possível identificar token comprado`);
         }
-      } catch (err: any) {
-        logger.error(`❌ Erro no fallback receipt para ${tx.hash}: ${err.message}`);
       }
-    }, 3000);
-  }
+    } catch (err: any) {
+      logger.error(`❌ Erro ao processar receipt para ${tx.hash}: ${err.message}`);
+    }
+  }, 3000);
 }
 
 function connectWS(): void {
@@ -320,8 +400,6 @@ function connectWS(): void {
 
       const blockHash = msg.params.result?.hash;
       if (!blockHash) return;
-
-      // logger.info(`📦 Bloco recebido: ${blockHash}`);
 
       const rpcRes = await fetch(process.env.ALCHEMY_HTTP_URL!, {
         method: "POST",
